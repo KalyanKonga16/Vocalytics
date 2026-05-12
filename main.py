@@ -9,29 +9,37 @@ st.set_page_config(page_title="Support Auditor", layout="wide")
 st.title("🎧 Multi-Modal Customer Support Auditor")
 
 # Connect to Database
-@st.cache_resource
-def init_connection():
-    return psycopg2.connect(st.secrets["DATABASE_URL"])
+import time
+import psycopg2
+import pandas as pd
+import streamlit as st
 
-conn = init_connection()
+# Function to fetch data safely with auto-reconnect
+def fetch_analytics_data():
+    db_url = st.secrets["DATABASE_URL"]
+    
+    # Try fetching up to 3 times to handle Neon cold-starts
+    for i in range(3):
+        try:
+            # 1. Open a fresh connection
+            conn = psycopg2.connect(db_url)
+            
+            # 2. Grab the data
+            df = pd.read_sql("SELECT * FROM call_analytics ORDER BY processed_at DESC", conn)
+            
+            # 3. Close the connection immediately (Serverless friendly!)
+            conn.close()
+            return df
+            
+        except psycopg2.OperationalError as e:
+            if i < 2:
+                time.sleep(2)  # Wait 2 seconds for Neon to wake up
+                continue
+            else:
+                raise e
 
-# Sidebar: File Upload
-st.sidebar.header("Upload New Call")
-uploaded_file = st.sidebar.file_uploader("Upload Audio (mp3/wav)", type=['mp3', 'wav'])
-
-if uploaded_file is not None:
-    if st.sidebar.button("Process Call"):
-        # Upload to S3 directly from Streamlit
-        s3 = boto3.client(
-            's3',
-            aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
-            aws_secret_access_key=st.secrets["AWS_SECRET_KEY"]
-        )
-        s3.upload_fileobj(uploaded_file, st.secrets["S3_BUCKET"], uploaded_file.name)
-        st.sidebar.success("File uploaded to S3! Analysis agent triggered.")
-
-# Main Dashboard
-df = pd.read_sql("SELECT * FROM call_analytics", conn)
+# Fetch the data using our new bulletproof function
+df = fetch_analytics_data()
 
 if not df.empty:
     # Top Row Metrics
