@@ -5,8 +5,21 @@ import boto3
 import os
 import plotly.express as px
 
-st.set_page_config(page_title="Support Auditor", layout="wide")
-st.title("🎧 Multi-Modal Customer Support Auditor")
+# Sidebar: File Upload
+st.sidebar.header("Upload New Call")
+uploaded_file = st.sidebar.file_uploader("Upload Audio (mp3/wav)", type=['mp3', 'wav'])
+
+if uploaded_file is not None:
+    if st.sidebar.button("Process Call"):
+        # Ensure your AWS credentials and S3 bucket name are in Streamlit secrets!
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=st.secrets["AWS_ACCESS_KEY"],
+            aws_secret_access_key=st.secrets["AWS_SECRET_KEY"]
+        )
+        s3.upload_fileobj(uploaded_file, st.secrets["S3_BUCKET"], uploaded_file.name)
+        st.sidebar.success("File uploaded to S3! Analysis agent triggered.")
+        st.experimental_rerun() # This will force the app to rerun and fetch new data
 
 # Connect to Database
 import time
