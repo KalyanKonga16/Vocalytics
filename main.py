@@ -19,7 +19,7 @@ if uploaded_file is not None:
         )
         s3.upload_fileobj(uploaded_file, st.secrets["S3_BUCKET"], uploaded_file.name)
         st.sidebar.success("File uploaded to S3! Analysis agent triggered.")
-        st.experimental_rerun() # This will force the app to rerun and fetch new data
+        st.rerun() # This will force the app to rerun and fetch new data
 
 # Connect to Database
 import time
