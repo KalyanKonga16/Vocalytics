@@ -28,19 +28,35 @@ def lambda_handler(event, context):
     transcript = response.json()['text']
     
     # 4. Analyze with Llama 3
-    prompt = f"""
-    Analyze this customer support transcript. Return ONLY a valid JSON object with exactly these keys:
-    "customer_sentiment" (positive, negative, or neutral),
-    "topic" (e.g., billing_issue, technical_support, refund, etc.),
-    "problem_resolved" (true or false).
-    Transcript: {transcript}
-    """
-    
-    llama_data = {
-        "model": "llama3-8b-8192",
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"}
-    }
+           # 4. Analyze with Llama 3.1 - MULTILINGUAL VERSION
+        prompt = f"""
+        You are an expert customer support analyst. Analyze the following transcript.
+
+        Transcript Language: Detect automatically.
+        Task: Return ONLY a valid JSON object with exactly these keys:
+        - "customer_sentiment": "positive", "negative", or "neutral"
+        - "topic": Use English only. Common topics: billing_issue, technical_support, refund, pricing_inquiry, product_complaint, service_cancellation, login_issue, shipping_delay, other.
+        - "problem_resolved": true or false
+
+        Rules:
+        - Understand the sentiment and context even if the transcript is in Hindi, Tamil, Spanish, French, or any other language.
+        - Always return topic in English.
+        - Be accurate with whether the agent's solution satisfied the customer.
+
+        Transcript:
+        {transcript}
+        """
+
+        llama_data = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [
+                {"role": "system", "content": "You are a precise JSON-only customer support analyzer. Always respond with valid JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.0,
+            "max_tokens": 300
+        }
     
     llama_resp = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=llama_data)
     analysis = json.loads(llama_resp.json()['choices'][0]['message']['content'])
