@@ -58,33 +58,29 @@ def lambda_handler(event, context):
             return {"statusCode": 200, "body": "Duplicate audio. Skipped."}
         print("STEP 5: No audio duplicate found.")
 
-        # STEP 6: Transcribe with Groq Whisper (FORCE ENGLISH OUTPUT)
+        # STEP 6: Translate audio to English using Groq Whisper
         groq_key = os.environ.get("GROQ_API_KEY")
         if not groq_key:
             raise ValueError("GROQ_API_KEY is not set.")
 
         headers = {"Authorization": f"Bearer {groq_key}"}
-        print("STEP 6: Calling Whisper (English translation mode)...")
+        print("STEP 6: Calling Whisper Translation API...")
 
         with open(download_path, "rb") as audio_file:
             whisper_resp = requests.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
+                "https://api.groq.com/openai/v1/audio/translations",
                 headers=headers,
                 files={"file": (filename_only, audio_file)},
-                data={
-                    "model": "whisper-large-v3",
-                    "task": "translate",          # <-- FORCES ENGLISH OUTPUT
-                    "response_format": "json"     # <-- ensures clean JSON return
-                }
+                data={"model": "whisper-large-v3"}
             )
 
         if whisper_resp.status_code != 200:
-            print(f"Whisper error: {whisper_resp.text}")
+            print(f"Whisper translation error: {whisper_resp.text}")
         whisper_resp.raise_for_status()
 
         transcript = whisper_resp.json().get("text", "").strip()
-        print(f"STEP 6: English Transcript: {transcript[:100]}...")
-        
+        print(f"STEP 6: English transcript: {transcript[:100]}...")
+
         # STEP 7: Content-based duplicate check
         normalized = normalize_text(transcript)
         transcript_hash = hashlib.md5(normalized.encode("utf-8")).hexdigest()
