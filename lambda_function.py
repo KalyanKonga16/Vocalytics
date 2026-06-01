@@ -10,6 +10,7 @@ import re
 s3 = boto3.client("s3")
 
 def normalize_text(text: str) -> str:
+    """Normalize transcript for content-based dedup comparison"""
     text = text.lower().strip()
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"[^\w\s]", "", text)
@@ -20,175 +21,165 @@ def lambda_handler(event, context):
     cursor = None
 
     try:
-        # 1. Get S3 event data
+        # STEP 1: Extract S3 file info
         bucket = event["Records"][0]["s3"]["bucket"]["name"]
-        key = urllib.parse.unquote_plus(event["Records"][0]["s3"]["object"]["key"], encoding="utf-8")
+        key = urllib.parse.unquote_plus(
+            event["Records"][0]["s3"]["object"]["key"],
+            encoding="utf-8"
+        )
         filename_only = key.split("/")[-1]
         download_path = f"/tmp/{filename_only}"
+        print(f"STEP 1: File received: s3://{bucket}/{key}")
 
-        print(f"Processing S3 object: s3://{bucket}/{key}")
-
-        # 2. Download file
+        # STEP 2: Download audio file
         s3.download_file(bucket, key, download_path)
-        print("File downloaded successfully.")
+        print("STEP 2: Downloaded successfully.")
 
-        # 3. Compute exact audio hash (MD5 to match SQL backfill)
+        # STEP 3: Compute audio hash for exact dedup
         with open(download_path, "rb") as f:
-            audio_bytes = f.read()
+            audio_hash = hashlib.md5(f.read()).hexdigest()
+        print(f"STEP 3: Audio hash: {audio_hash}")
 
-        audio_hash = hashlib.md5(audio_bytes).hexdigest()
-        print(f"Audio hash: {audio_hash}")
-
-        # 4. Connect to DB
-        conn = psycopg2.connect(os.environ["DATABASE_URL"])
+        # STEP 4: Connect to database
+        db_url = os.environ.get("DATABASE_URL")
+        if not db_url:
+            raise ValueError("DATABASE_URL is not set.")
+        conn = psycopg2.connect(db_url)
         cursor = conn.cursor()
+        print("STEP 4: DB connected.")
 
-        # 5. EXACT AUDIO DUPLICATE CHECK
-        cursor.execute("""
-            SELECT id, duplicate_count
-            FROM call_analytics
-            WHERE audio_hash = %s
-            LIMIT 1
-        """, (audio_hash,))
-        exact_duplicate = cursor.fetchone()
+        # STEP 5: Exact audio duplicate check
+        cursor.execute(
+            "SELECT id FROM call_analytics WHERE audio_hash = %s LIMIT 1",
+            (audio_hash,)
+        )
+        if cursor.fetchone():
+            print("STEP 5: Exact audio duplicate. Skipping.")
+            return {"statusCode": 200, "body": "Duplicate audio. Skipped."}
+        print("STEP 5: No audio duplicate found.")
 
-        if exact_duplicate:
-            existing_id = exact_duplicate[0]
-            cursor.execute("""
-                UPDATE call_analytics
-                SET duplicate_count = COALESCE(duplicate_count, 0) + 1,
-                    last_seen_at = CURRENT_TIMESTAMP,
-                    last_uploaded_filename = %s
-                WHERE id = %s
-            """, (filename_only, existing_id))
-            conn.commit()
-            print(f"Exact duplicate audio detected. Updated row id={existing_id}")
-            return {"statusCode": 200, "body": "Exact duplicate detected."}
+        # STEP 6: Transcribe with Groq Whisper
+        groq_key = os.environ.get("GROQ_API_KEY")
+        if not groq_key:
+            raise ValueError("GROQ_API_KEY is not set.")
 
-        # 6. Whisper Transcription
-        groq_api_key = os.environ["GROQ_API_KEY"]
-        headers = {"Authorization": f"Bearer {groq_api_key}"}
+        headers = {"Authorization": f"Bearer {groq_key}"}
+        print("STEP 6: Calling Whisper...")
 
-        print("Calling Groq Whisper API...")
-        with open(download_path, "rb") as file:
-            files = {"file": (filename_only, file)}
-            data = {"model": "whisper-large-v3"}
-            response = requests.post(
+        with open(download_path, "rb") as audio_file:
+            whisper_resp = requests.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers=headers, files=files, data=data
+                headers=headers,
+                files={"file": (filename_only, audio_file)},
+                data={"model": "whisper-large-v3"}
             )
 
-        response.raise_for_status()
-        transcript = response.json()["text"]
-        print(f"Whisper success: {transcript[:100]}...")
+        if whisper_resp.status_code != 200:
+            print(f"Whisper error: {whisper_resp.text}")
+        whisper_resp.raise_for_status()
 
-        # 7. Normalize & Hash Transcript (MD5 to match SQL backfill)
-        normalized_transcript = normalize_text(transcript)
-        transcript_hash = hashlib.md5(normalized_transcript.encode("utf-8")).hexdigest()
+        transcript = whisper_resp.json().get("text", "").strip()
+        print(f"STEP 6: Transcript: {transcript[:100]}...")
 
-        # 8. CONTENT DUPLICATE CHECK
-        cursor.execute("""
-            SELECT id, duplicate_count
-            FROM call_analytics
-            WHERE transcript_hash = %s
-            LIMIT 1
-        """, (transcript_hash,))
-        content_duplicate = cursor.fetchone()
+        # STEP 7: Content-based duplicate check
+        normalized = normalize_text(transcript)
+        transcript_hash = hashlib.md5(normalized.encode("utf-8")).hexdigest()
 
-        if content_duplicate:
-            existing_id = content_duplicate[0]
-            cursor.execute("""
-                UPDATE call_analytics
-                SET duplicate_count = COALESCE(duplicate_count, 0) + 1,
-                    last_seen_at = CURRENT_TIMESTAMP,
-                    last_uploaded_filename = %s
-                WHERE id = %s
-            """, (filename_only, existing_id))
-            conn.commit()
-            print(f"Transcript duplicate detected. Updated row id={existing_id}")
-            return {"statusCode": 200, "body": "Transcript duplicate detected."}
+        cursor.execute(
+            "SELECT id FROM call_analytics WHERE transcript_hash = %s LIMIT 1",
+            (transcript_hash,)
+        )
+        if cursor.fetchone():
+            print("STEP 7: Same content already analyzed. Skipping.")
+            return {"statusCode": 200, "body": "Duplicate content. Skipped."}
+        print("STEP 7: No content duplicate found.")
 
-        # 9. Llama Analysis (FORCED ENGLISH OUTPUT)
-        prompt = f"""
-        Analyze this customer support transcript. 
-        The transcript may be in ANY language, but you MUST return the JSON values in ENGLISH only.
-        
-        Return ONLY a valid JSON object with exactly these keys:
-        - "customer_sentiment": "positive", "negative", or "neutral"
-        - "topic": Use English only (e.g., billing_issue, technical_support, refund, pricing_inquiry, login_issue, service_cancellation, shipping_delay, other)
-        - "problem_resolved": true or false
-
-        Transcript:
-        {transcript}
-        """
-
-        llama_data = {
-            "model": "llama-3.1-8b-instant",
-            "messages": [
-                {"role": "system", "content": "You are a helpful AI that outputs only valid JSON in English."},
-                {"role": "user", "content": prompt}
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.0
-        }
-
-        print("Calling Groq Llama API...")
+        # STEP 8: Analyze with Llama 3.1
+        print("STEP 8: Calling Llama...")
         llama_resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers, json=llama_data
+            headers=headers,
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a customer support call analyst. "
+                            "Always respond with valid JSON only. "
+                            "All output values must be in English regardless of transcript language."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""
+Analyze this customer support call transcript carefully.
+The audio may be in any language. Return values in English only.
+
+Return ONLY this exact JSON:
+{{
+  "customer_sentiment": "positive" or "negative" or "neutral",
+  "topic": exactly one of: billing_issue, technical_support, refund, pricing_inquiry, login_issue, service_cancellation, shipping_delay, product_complaint, other,
+  "problem_resolved": true or false
+}}
+
+Base problem_resolved on whether the agent fully solved the issue before the call ended.
+
+Transcript:
+{transcript}
+"""
+                    }
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.0,
+                "max_tokens": 150
+            }
         )
 
         if llama_resp.status_code != 200:
-            print(f"Groq Llama error: {llama_resp.text}")
-
+            print(f"Llama error: {llama_resp.text}")
         llama_resp.raise_for_status()
 
         analysis = json.loads(llama_resp.json()["choices"][0]["message"]["content"])
-        print(f"Llama success: {analysis}")
+        print(f"STEP 8: Analysis result: {analysis}")
 
-        # 10. Normalize Data
-        problem_resolved = analysis.get("problem_resolved", False)
-        if isinstance(problem_resolved, str):
-            problem_resolved = problem_resolved.strip().lower() == "true"
-
-        customer_sentiment = str(analysis.get("customer_sentiment", "neutral")).strip().lower()
+        # STEP 9: Sanitize values
+        sentiment = str(analysis.get("customer_sentiment", "neutral")).strip().lower()
         topic = str(analysis.get("topic", "other")).strip().lower()
+        resolved = analysis.get("problem_resolved", False)
+        if isinstance(resolved, str):
+            resolved = resolved.strip().lower() == "true"
 
-        # 11. INSERT NEW ROW
+        # STEP 10: Insert into database
+        print("STEP 10: Inserting into DB...")
         cursor.execute("""
             INSERT INTO call_analytics (
                 filename,
-                last_uploaded_filename,
-                transcript,
-                normalized_transcript,
-                audio_hash,
-                transcript_hash,
-                customer_sentiment,
                 topic,
+                customer_sentiment,
                 problem_resolved,
-                duplicate_count,
-                last_seen_at
+                transcript,
+                processed_at,
+                audio_hash,
+                transcript_hash
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 0, CURRENT_TIMESTAMP)
+            VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP, %s, %s)
         """, (
             filename_only,
-            filename_only,
-            transcript,
-            normalized_transcript,
-            audio_hash,
-            transcript_hash,
-            customer_sentiment,
             topic,
-            problem_resolved
+            sentiment,
+            resolved,
+            transcript,
+            audio_hash,
+            transcript_hash
         ))
 
         conn.commit()
-        print("Data successfully saved to PostgreSQL.")
-
+        print("STEP 10: Successfully saved to DB.")
         return {"statusCode": 200, "body": "Success"}
 
     except Exception as e:
-        print(f"ERROR: {str(e)}")
+        print(f"FATAL ERROR: {type(e).__name__}: {str(e)}")
         raise e
 
     finally:
@@ -196,3 +187,4 @@ def lambda_handler(event, context):
             cursor.close()
         if conn:
             conn.close()
+        print("FINAL: DB connection closed.")
