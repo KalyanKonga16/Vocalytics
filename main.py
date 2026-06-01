@@ -27,7 +27,7 @@ def find_existing_audio(audio_hash):
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, filename, topic, customer_sentiment
+            SELECT id, filename, topic, customer_sentiment, duplicate_count
             FROM call_analytics
             WHERE audio_hash = %s
             LIMIT 1
@@ -68,11 +68,13 @@ if uploaded_file is not None:
             f"This audio was already analyzed.\n"
             f"Original File: `{existing_audio[1]}`\n"
             f"Topic: `{existing_audio[2]}`\n"
-            f"Sentiment: `{existing_audio[3]}`"
+            f"Sentiment: `{existing_audio[3]}`\n"
+            f"Times Uploaded: `{existing_audio[4] + 1}`"
         )
     else:
         if st.sidebar.button("Process Call"):
             try:
+                # Use .get() for safe access to secrets
                 s3 = boto3.client(
                     "s3",
                     aws_access_key_id=st.secrets.get("AWS_ACCESS_KEY"),
@@ -93,17 +95,18 @@ if uploaded_file is not None:
 df = fetch_analytics_data()
 
 if not df.empty:
-    # --- KPI Metrics ---
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total Calls Analyzed", len(df))
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Unique Calls", len(df))
     
     negative_calls = len(df[df["customer_sentiment"] == "negative"])
     col2.metric("Negative Sentiment", negative_calls)
     
     resolved_pct = (len(df[df["problem_resolved"] == True]) / len(df) * 100 if len(df) > 0 else 0)
     col3.metric("Resolution Rate", f"{resolved_pct:.1f}%")
+    
+    blocked_duplicates = int(df["duplicate_count"].fillna(0).sum()) if "duplicate_count" in df.columns else 0
+    col4.metric("Duplicate Uploads Blocked", blocked_duplicates)
 
-    # --- Charts ---
     col_chart1, col_chart2 = st.columns(2)
     
     with col_chart1:
@@ -120,25 +123,10 @@ if not df.empty:
         fig = px.bar(sent_counts, x="sentiment", y="count", color="sentiment")
         st.plotly_chart(fig, use_container_width=True)
 
-    # --- Clean Data Table (NO INTERNAL COLUMNS) ---
     st.subheader("Recent Transcripts & Analysis")
     
-    # Only show business-relevant columns
-    display_columns = [
-        "filename",
-        "topic",
-        "customer_sentiment",
-        "problem_resolved",
-        "transcript"
-    ]
-    
-    # Safely filter only columns that exist
-    safe_columns = [col for col in display_columns if col in df.columns]
-    
-    st.dataframe(
-        df[safe_columns], 
-        use_container_width=True,
-        hide_index=True
-    )
+    # Select columns safely
+    display_cols = [c for c in ["filename", "topic", "customer_sentiment", "problem_resolved", "duplicate_count", "transcript"] if c in df.columns]
+    st.dataframe(df[display_cols], use_container_width=True)
 else:
     st.info("No data yet. Upload an audio file to begin!")
