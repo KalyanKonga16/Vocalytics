@@ -32,18 +32,18 @@ def lambda_handler(event, context):
         s3.download_file(bucket, key, download_path)
         print("File downloaded successfully.")
 
-        # 3. Compute exact audio hash
+        # 3. Compute exact audio hash (MD5 to match SQL backfill)
         with open(download_path, "rb") as f:
             audio_bytes = f.read()
 
-        audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+        audio_hash = hashlib.md5(audio_bytes).hexdigest()
         print(f"Audio hash: {audio_hash}")
 
         # 4. Connect to DB
         conn = psycopg2.connect(os.environ["DATABASE_URL"])
         cursor = conn.cursor()
 
-        # 5. EXACT AUDIO DUPLICATE CHECK (Save API costs)
+        # 5. EXACT AUDIO DUPLICATE CHECK
         cursor.execute("""
             SELECT id, duplicate_count
             FROM call_analytics
@@ -82,11 +82,11 @@ def lambda_handler(event, context):
         transcript = response.json()["text"]
         print(f"Whisper success: {transcript[:100]}...")
 
-        # 7. Normalize & Hash Transcript
+        # 7. Normalize & Hash Transcript (MD5 to match SQL backfill)
         normalized_transcript = normalize_text(transcript)
-        transcript_hash = hashlib.sha256(normalized_transcript.encode("utf-8")).hexdigest()
+        transcript_hash = hashlib.md5(normalized_transcript.encode("utf-8")).hexdigest()
 
-        # 8. CONTENT DUPLICATE CHECK (Different file, same words)
+        # 8. CONTENT DUPLICATE CHECK
         cursor.execute("""
             SELECT id, duplicate_count
             FROM call_analytics
@@ -154,7 +154,7 @@ def lambda_handler(event, context):
         customer_sentiment = str(analysis.get("customer_sentiment", "neutral")).strip().lower()
         topic = str(analysis.get("topic", "other")).strip().lower()
 
-        # 11. INSERT NEW ROW (All columns explicitly filled)
+        # 11. INSERT NEW ROW
         cursor.execute("""
             INSERT INTO call_analytics (
                 filename,
