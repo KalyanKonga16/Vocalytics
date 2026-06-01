@@ -5,9 +5,20 @@ import boto3
 import time
 import hashlib
 import plotly.express as px
+from datetime import datetime
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title="Vocalytics", layout="wide")
 st.title("🎧 Multi-Modal Customer Support Auditor")
+
+# ==================== AUTO REFRESH ====================
+# Refresh dashboard every 10 seconds
+refresh_count = st_autorefresh(interval=10 * 1000, key="vocalytics_refresh")
+
+st.caption(
+    f"🔄 Auto-refresh is ON | Refresh count: {refresh_count} | "
+    f"Last checked: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+)
 
 # ==================== DB ====================
 def get_connection():
@@ -20,8 +31,7 @@ def get_connection():
             else:
                 raise
 
-def is_duplicate(audio_hash: str) -> dict | None:
-    """Returns existing record info if duplicate, else None"""
+def is_duplicate(audio_hash: str):
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -45,17 +55,17 @@ def is_duplicate(audio_hash: str) -> dict | None:
     except Exception:
         return None
 
-def fetch_data() -> pd.DataFrame:
+def fetch_data():
     try:
         conn = get_connection()
         df = pd.read_sql_query("""
             SELECT
-                filename         AS "File",
-                topic            AS "Topic",
+                filename AS "File",
+                topic AS "Topic",
                 customer_sentiment AS "Sentiment",
                 problem_resolved AS "Resolved",
-                processed_at     AS "Analyzed At",
-                transcript       AS "Transcript"
+                processed_at AS "Analyzed At",
+                transcript AS "Transcript"
             FROM call_analytics
             ORDER BY processed_at DESC
         """, conn)
@@ -95,11 +105,13 @@ if uploaded_file is not None:
                     aws_secret_access_key=st.secrets.get("AWS_SECRET_KEY"),
                     region_name=st.secrets.get("AWS_REGION", "us-east-1")
                 )
+
                 s3_key = f"uploads/{audio_hash}_{uploaded_file.name}"
                 uploaded_file.seek(0)
                 s3.upload_fileobj(uploaded_file, st.secrets["S3_BUCKET"], s3_key)
+
                 st.sidebar.success("✅ Uploaded! Analysis in progress.")
-                st.sidebar.info("⏳ Wait 15–20 seconds, then refresh the page.")
+                st.sidebar.info("⏳ Dashboard will update automatically within a few seconds.")
             except Exception as e:
                 st.sidebar.error(f"Upload failed: {str(e)}")
 
@@ -107,28 +119,26 @@ if uploaded_file is not None:
 df = fetch_data()
 
 if not df.empty:
-
-    # --- KPI Row ---
-    total     = len(df)
-    negative  = len(df[df["Sentiment"] == "negative"])
-    resolved  = len(df[df["Resolved"] == True])
-    res_pct   = round((resolved / total) * 100, 1) if total > 0 else 0
+    total = len(df)
+    negative = len(df[df["Sentiment"] == "negative"])
+    resolved = len(df[df["Resolved"] == True])
+    res_pct = round((resolved / total) * 100, 1) if total > 0 else 0
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("📞 Total Calls",       total)
-    k2.metric("😡 Negative Calls",    negative)
-    k3.metric("✅ Resolved",          resolved)
-    k4.metric("📈 Resolution Rate",   f"{res_pct}%")
+    k1.metric("📞 Total Calls", total)
+    k2.metric("😡 Negative Calls", negative)
+    k3.metric("✅ Resolved", resolved)
+    k4.metric("📈 Resolution Rate", f"{res_pct}%")
 
     st.divider()
 
-    # --- Charts ---
     c1, c2 = st.columns(2)
 
     with c1:
         st.subheader("🏷️ Calls by Topic")
         topic_df = df["Topic"].value_counts().reset_index()
         topic_df.columns = ["Topic", "Count"]
+
         fig = px.pie(
             topic_df,
             values="Count",
@@ -142,11 +152,13 @@ if not df.empty:
         st.subheader("😊 Sentiment Breakdown")
         sent_df = df["Sentiment"].value_counts().reset_index()
         sent_df.columns = ["Sentiment", "Count"]
+
         color_map = {
             "negative": "#EF4444",
-            "neutral":  "#F59E0B",
+            "neutral": "#F59E0B",
             "positive": "#10B981"
         }
+
         fig = px.bar(
             sent_df,
             x="Sentiment",
@@ -159,7 +171,6 @@ if not df.empty:
 
     st.divider()
 
-    # --- Calls Table (Manager View) ---
     st.subheader("📋 Call Records")
     st.dataframe(
         df[[
