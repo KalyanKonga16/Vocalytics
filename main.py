@@ -15,11 +15,6 @@ st.title("🎧 Multi-Modal Customer Support Auditor")
 # Refresh dashboard every 10 seconds
 refresh_count = st_autorefresh(interval=10 * 1000, key="vocalytics_refresh")
 
-st.caption(
-    f"🔄 Auto-refresh is ON | Refresh count: {refresh_count} | "
-    f"Last checked: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-)
-
 # ==================== DB ====================
 def get_connection():
     for i in range(3):
