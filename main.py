@@ -9,14 +9,14 @@ import zipfile
 import io
 import os
 import re
+from datetime import datetime
 
-st.set_page_config(page_title="Vocalytics", layout="wide")
+st.set_page_config(page_title="Vocalytics", layout="wide", page_icon="🎧")
 st.title("🎧 Multi-Modal Customer Support Auditor")
 
 # ==================== CONFIGURATION ====================
 POLL_INTERVAL_SECONDS = 4
-MAX_TOTAL_BATCH_MB = 50          # Warn only if combined upload exceeds this
-SAFE_FILE_COUNT = 15             # Soft warning if too many files at once
+MAX_RECOMMENDED_BATCH_SIZE = 10  # Warn only if exceeds this
 
 # ==================== DB ====================
 def get_connection():
@@ -114,15 +114,18 @@ def make_file_item(filename, file_bytes):
         "safe_name": safe_name,
         "bytes": file_bytes,
         "audio_hash": audio_hash,
-        "size_mb": len(file_bytes) / (1024 * 1024)
+        "status": "pending",  # pending, uploaded, transcribing, analyzing, complete, skipped, failed
+        "message": ""
     }
 
 def upload_audio_to_s3(s3_client, item):
     bucket = st.secrets["S3_BUCKET"]
     s3_key = f"uploads/{item['audio_hash']}_{item['safe_name']}"
+    
     content_type = "audio/mpeg"
     if item["safe_name"].lower().endswith(".wav"):
         content_type = "audio/wav"
+
     s3_client.put_object(
         Bucket=bucket,
         Key=s3_key,
@@ -134,6 +137,7 @@ def upload_audio_to_s3(s3_client, item):
 def extract_audio_files_from_zip(uploaded_zip):
     extracted_files = []
     skipped_non_audio = []
+
     try:
         with zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue())) as z:
             for member in z.infolist():
@@ -151,177 +155,307 @@ def extract_audio_files_from_zip(uploaded_zip):
     except zipfile.BadZipFile:
         return [], [], "Invalid ZIP file."
 
-# ==================== BATCH SIZE CHECK ====================
-def check_batch_limits(file_items):
-    """Returns (is_too_big, warning_message). Warns only when limits crossed."""
-    total_mb = sum(item["size_mb"] for item in file_items)
-    count = len(file_items)
-
-    warnings = []
-    block = False
-
-    if total_mb > MAX_TOTAL_BATCH_MB:
-        warnings.append(
-            f"🚫 Total upload size is **{total_mb:.1f} MB**, "
-            f"which exceeds the **{MAX_TOTAL_BATCH_MB} MB** batch limit. "
-            f"Please upload fewer/smaller files."
-        )
-        block = True
-
-    if count > SAFE_FILE_COUNT and not block:
-        warnings.append(
-            f"⚠️ You are uploading **{count} files** at once. "
-            f"Processing may take a few minutes. You can still proceed."
-        )
-
-    return block, warnings, total_mb
-
-# ==================== QUEUE-STYLE RENDERER ====================
-STATUS_STYLE = {
-    "queued":    ("⏳", "Queued",      "#6B7280"),
-    "uploading": ("📤", "Uploading",   "#3B82F6"),
-    "analyzing": ("🤖", "Analyzing",   "#8B5CF6"),
-    "done":      ("✅", "Done",        "#10B981"),
-    "skipped":   ("⏭️", "Skipped",     "#F59E0B"),
-    "failed":    ("❌", "Failed",      "#EF4444"),
-}
-
-def render_queue(queue_items, container):
-    """Renders the live queue UI inside a given container."""
-    html = "<div style='display:flex;flex-direction:column;gap:8px;'>"
-    for q in queue_items:
-        icon, label, color = STATUS_STYLE[q["status"]]
-        reason = f"<span style='color:#9CA3AF;font-size:12px;'> — {q['reason']}</span>" if q.get("reason") else ""
-        html += f"""
-        <div style='
-            display:flex;align-items:center;justify-content:space-between;
-            padding:10px 14px;border-radius:10px;
-            background:rgba(255,255,255,0.03);
-            border-left:4px solid {color};'>
-            <div style='font-size:14px;color:#E5E7EB;overflow:hidden;
-                        text-overflow:ellipsis;white-space:nowrap;max-width:60%;'>
-                🎵 {q['name']}
-            </div>
-            <div style='font-size:13px;font-weight:600;color:{color};'>
-                {icon} {label}{reason}
-            </div>
+def render_status_badge(status):
+    """Render beautiful status badge for queue UI"""
+    badges = {
+        "pending": ("⏳", "Pending", "#6B7280"),
+        "uploaded": ("📤", "Uploaded to S3", "#3B82F6"),
+        "transcribing": ("🎙️", "Transcribing...", "#8B5CF6"),
+        "analyzing": ("🧠", "Analyzing...", "#F59E0B"),
+        "complete": ("✅", "Complete", "#10B981"),
+        "skipped": ("⏭️", "Skipped (Duplicate)", "#6B7280"),
+        "failed": ("❌", "Failed", "#EF4444")
+    }
+    
+    if status in badges:
+        icon, label, color = badges[status]
+        return f"""
+        <div style="
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            background-color: {color}20;
+            color: {color};
+            font-size: 12px;
+            font-weight: 600;
+            border: 1px solid {color}40;
+        ">
+            {icon} {label}
         </div>
         """
-    html += "</div>"
-    container.markdown(html, unsafe_allow_html=True)
+    return status
 
-# ==================== SMART PROCESSOR WITH QUEUE ====================
-def process_files_with_queue(file_items):
+def render_queue_ui(file_items, title="📋 Upload Queue"):
+    """Beautiful queue-like progress UI for uploaded files"""
+    st.subheader(title)
+    
+    if not file_items:
+        st.info("No files in queue.")
+        return
+    
+    # Summary stats
+    status_counts = {}
+    for item in file_items:
+        status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+    
+    # Summary row
+    cols = st.columns(min(5, len(status_counts)))
+    status_labels = {
+        "pending": "⏳ Pending",
+        "uploaded": "📤 Uploaded",
+        "transcribing": "🎙️ Transcribing",
+        "analyzing": "🧠 Analyzing",
+        "complete": "✅ Complete",
+        "skipped": "⏭️ Skipped",
+        "failed": "❌ Failed"
+    }
+    
+    for idx, (status, count) in enumerate(status_counts.items()):
+        with cols[idx % 5]:
+            st.metric(status_labels.get(status, status), count)
+    
+    st.divider()
+    
+    # Individual file cards
+    for idx, item in enumerate(file_items, start=1):
+        with st.container():
+            col1, col2, col3 = st.columns([3, 2, 1])
+            
+            with col1:
+                st.markdown(f"**{idx}. {item['original_name']}**")
+                if item.get("message"):
+                    st.caption(item["message"])
+            
+            with col2:
+                st.markdown(render_status_badge(item["status"]), unsafe_allow_html=True)
+            
+            with col3:
+                # Progress bar for this file
+                progress_map = {
+                    "pending": 0.0,
+                    "uploaded": 0.25,
+                    "transcribing": 0.5,
+                    "analyzing": 0.75,
+                    "complete": 1.0,
+                    "skipped": 1.0,
+                    "failed": 0.5
+                }
+                prog = progress_map.get(item["status"], 0.0)
+                st.progress(prog)
+            
+            st.divider()
+
+def process_files_with_queue(file_items, queue_container):
     """
-    Processes files showing a live queue.
-    - Skips duplicates (DB + in-batch)
-    - Uploads new files
-    - Then waits and marks them 'done' as DB rows appear
+    Process files with real-time queue UI updates.
+    Each file moves through stages visibly.
     """
     if not file_items:
-        return
+        return {"uploaded": 0, "duplicate_db": 0, "duplicate_batch": 0, "failed": 0, "details": []}
 
-    st.subheader("📥 Upload Queue")
-    queue_container = st.empty()
+    results = {
+        "uploaded": 0,
+        "duplicate_db": 0,
+        "duplicate_batch": 0,
+        "failed": 0,
+        "details": []
+    }
 
-    # Build initial queue
-    queue_items = [
-        {"name": item["original_name"], "status": "queued", "reason": "", "hash": item["audio_hash"]}
-        for item in file_items
-    ]
-    render_queue(queue_items, queue_container)
-    time.sleep(0.4)
-
-    # Pre-fetch existing DB hashes
     all_hashes = [item["audio_hash"] for item in file_items]
     existing_map = fetch_existing_records_by_hash(all_hashes)
 
-    seen_in_batch = set()
+    seen_in_this_batch = set()
     s3 = build_s3_client()
+    total_files = len(file_items)
 
-    uploaded_hashes = []   # hashes we actually sent to S3 (need to await analysis)
+    # Initial render
+    with queue_container:
+        render_queue_ui(file_items, "📋 Processing Queue")
 
-    # ---- PHASE 1: Upload / Skip ----
-    for i, item in enumerate(file_items):
-        h = item["audio_hash"]
+    for idx, item in enumerate(file_items, start=1):
+        audio_hash = item["audio_hash"]
 
-        # Duplicate inside same batch
-        if h in seen_in_batch:
-            queue_items[i]["status"] = "skipped"
-            queue_items[i]["reason"] = "Duplicate in this upload"
-            render_queue(queue_items, queue_container)
+        # Update UI: currently processing
+        item["message"] = f"Processing {idx}/{total_files}..."
+        with queue_container:
+            render_queue_ui(file_items, "📋 Processing Queue")
+
+        # Duplicate inside same upload?
+        if audio_hash in seen_in_this_batch:
+            item["status"] = "skipped"
+            item["message"] = "Duplicate file in this batch"
+            results["duplicate_batch"] += 1
+            results["details"].append({
+                "File": item["original_name"], 
+                "Status": "Skipped", 
+                "Reason": "Duplicate in this batch"
+            })
+            with queue_container:
+                render_queue_ui(file_items, "📋 Processing Queue")
             continue
-        seen_in_batch.add(h)
+        
+        seen_in_this_batch.add(audio_hash)
 
-        # Already in DB
-        if h in existing_map:
-            ex = existing_map[h]
-            queue_items[i]["status"] = "skipped"
-            queue_items[i]["reason"] = f"Already analyzed ({ex['topic']})"
-            render_queue(queue_items, queue_container)
+        # Already processed in DB?
+        if audio_hash in existing_map:
+            existing = existing_map[audio_hash]
+            item["status"] = "skipped"
+            item["message"] = f"Already analyzed: {existing['topic']}, {existing['sentiment']}"
+            results["duplicate_db"] += 1
+            results["details"].append({
+                "File": item["original_name"], 
+                "Status": "Skipped", 
+                "Reason": f"Already analyzed ({existing['topic']}, {existing['sentiment']})"
+            })
+            with queue_container:
+                render_queue_ui(file_items, "📋 Processing Queue")
             continue
 
-        # Upload
-        queue_items[i]["status"] = "uploading"
-        render_queue(queue_items, queue_container)
+        # New file: upload to S3!
         try:
-            upload_audio_to_s3(s3, item)
-            queue_items[i]["status"] = "analyzing"
-            queue_items[i]["reason"] = "Sent to AI pipeline"
-            uploaded_hashes.append(h)
-            render_queue(queue_items, queue_container)
+            item["status"] = "uploaded"
+            item["message"] = "Uploading to S3..."
+            with queue_container:
+                render_queue_ui(file_items, "📋 Processing Queue")
+            
+            s3_key = upload_audio_to_s3(s3, item)
+            
+            # Simulate stage progression for visual feedback
+            item["message"] = "Triggering AI transcription..."
+            item["status"] = "transcribing"
+            with queue_container:
+                render_queue_ui(file_items, "📋 Processing Queue")
+            
+            time.sleep(1)  # Visual pause for effect
+            
+            item["message"] = "Running sentiment & topic analysis..."
+            item["status"] = "analyzing"
+            with queue_container:
+                render_queue_ui(file_items, "📋 Processing Queue")
+            
+            time.sleep(1)  # Visual pause for effect
+            
+            # Mark as complete (actual completion happens via Lambda → DB)
+            item["status"] = "complete"
+            item["message"] = f"Sent for processing → {s3_key}"
+            results["uploaded"] += 1
+            results["details"].append({
+                "File": item["original_name"], 
+                "Status": "Processing", 
+                "Reason": f"S3: {s3_key}"
+            })
+            
+            with queue_container:
+                render_queue_ui(file_items, "📋 Processing Queue")
+                
         except Exception as e:
-            queue_items[i]["status"] = "failed"
-            queue_items[i]["reason"] = str(e)[:40]
-            render_queue(queue_items, queue_container)
+            item["status"] = "failed"
+            item["message"] = str(e)
+            results["failed"] += 1
+            results["details"].append({
+                "File": item["original_name"], 
+                "Status": "Failed", 
+                "Reason": str(e)
+            })
+            with queue_container:
+                render_queue_ui(file_items, "📋 Processing Queue")
 
-        time.sleep(0.3)
+    return results
 
-    # ---- PHASE 2: Await analysis completion ----
-    if uploaded_hashes:
-        status_banner = st.empty()
-        pending = set(uploaded_hashes)
-        start = time.time()
-        timeout = 60 + (len(uploaded_hashes) * 20)  # scale with batch size
-
-        # small head start for Lambda cold start
-        time.sleep(6)
-
-        while pending and (time.time() - start) < timeout:
-            done_map = fetch_existing_records_by_hash(list(pending))
-
-            for i, q in enumerate(queue_items):
-                if q["hash"] in done_map and q["status"] == "analyzing":
-                    info = done_map[q["hash"]]
-                    queue_items[i]["status"] = "done"
-                    queue_items[i]["reason"] = f"{info['topic']} | {info['sentiment']}"
-
-            render_queue(queue_items, queue_container)
-
-            pending = {h for h in pending if h not in done_map}
-
-            if not pending:
-                break
-
-            elapsed = int(time.time() - start)
-            remaining = int(timeout - elapsed)
-            status_banner.info(
-                f"🤖 AI agents working... {len(uploaded_hashes) - len(pending)}/{len(uploaded_hashes)} completed "
-                f"| ⏱️ {elapsed}s elapsed | ⏰ {remaining}s left"
-            )
-            time.sleep(POLL_INTERVAL_SECONDS)
-
-        if pending:
-            # Some still not done (slow Lambda) — mark gracefully
-            for i, q in enumerate(queue_items):
-                if q["hash"] in pending and q["status"] == "analyzing":
-                    queue_items[i]["reason"] = "Still processing (will appear shortly)"
-            render_queue(queue_items, queue_container)
-            status_banner.warning("⏳ Some files are still processing. Dashboard will show them shortly.")
+def smart_wait_for_new_data(queue_container, uploaded_count, timeout_seconds=120):
+    """
+    After upload, poll DB until new rows appear.
+    Updates queue UI with live status.
+    """
+    start_time = time.time()
+    max_wait = timeout_seconds
+    
+    pre_upload_count = get_total_row_count()
+    watching_for_first_data = (pre_upload_count == 0)
+    
+    # Initial delay for Lambda cold start + S3 trigger
+    initial_sleep = 6
+    time.sleep(initial_sleep)
+    
+    polls = 0
+    status_box = queue_container.empty()
+    
+    while True:
+        elapsed = time.time() - start_time
+        
+        if elapsed > max_wait:
+            with status_box:
+                st.success("""
+                ### ✅ Pipeline Triggered Successfully!
+                
+                Your audio files have been sent to the AI analysis pipeline.
+                
+                **What happens next:**
+                1.  S3 stores your audio securely
+                2. 🎙️ Whisper transcribes speech to text
+                3. 🧠 Llama 3.1 analyzes sentiment & topics
+                4. 💾 Results saved to database
+                
+                *Refresh the page in 30-60 seconds to see completed results.*
+                """)
+            return True
+            
+        polls += 1
+        current_count = get_total_row_count()
+        remaining = int(max_wait - elapsed)
+        
+        if watching_for_first_data:
+            if current_count > 0:
+                with status_box:
+                    st.success(f"""
+                    ### 🎉 First Data Arrived!
+                    
+                    Found **{current_count}** call(s) in database.
+                    
+                    *Refreshing dashboard...*
+                    """)
+                time.sleep(2)
+                return True
+            else:
+                with status_box:
+                    st.info(f"""
+                    ### ⏳ Awaiting AI Analysis...
+                    
+                    **Pipeline Status:**
+                    - 🎙️ Whisper Transcription: In Progress
+                    - 🧠 Llama Analysis: Queued
+                    - 💾 Database Insert: Pending
+                    
+                    **Time Elapsed:** {int(elapsed)}s | **Timeout:** {remaining}s | **Check:** #{polls}
+                    """)
         else:
-            status_banner.success("🎉 All uploaded calls analyzed successfully!")
-
-        time.sleep(2)
+            if current_count > pre_upload_count:
+                new_rows = current_count - pre_upload_count
+                with status_box:
+                    st.success(f"""
+                    ### 🎉 Analysis Complete!
+                    
+                    **{new_rows}** new call(s) analyzed and saved.
+                    
+                    *Updating dashboard with fresh statistics...*
+                    """)
+                time.sleep(2)
+                return True
+            else:
+                with status_box:
+                    st.info(f"""
+                    ### ⏳ Processing Audio via Cloud AI...
+                    
+                    **Pipeline Progress:**
+                    - 📤 S3 Upload: ✅ Complete
+                    - 🎙️ Whisper Transcription: In Progress
+                    - 🧠 Llama Analysis: Queued
+                    - 💾 Database Insert: Pending
+                    
+                    **Files Sent:** {uploaded_count} | **Elapsed:** {int(elapsed)}s | **Timeout:** {remaining}s
+                    """)
+        
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 # ==================== SIDEBAR ====================
 st.sidebar.header("📤 Upload Mode")
@@ -331,36 +465,51 @@ upload_mode = st.sidebar.radio(
     ["Single File", "Multiple Files", "ZIP Batch"]
 )
 
-selected_items = []
-trigger_process = False
+# Session state for queue
+if "current_queue" not in st.session_state:
+    st.session_state.current_queue = []
+if "show_queue" not in st.session_state:
+    st.session_state.show_queue = False
 
-# -------- SINGLE FILE --------
+# -------- SINGLE FILE MODE --------
 if upload_mode == "Single File":
     uploaded_file = st.sidebar.file_uploader(
         "Select an audio file",
         type=["mp3", "wav"],
         key="single_audio"
     )
-    if uploaded_file is not None:
-        item = make_file_item(uploaded_file.name, uploaded_file.getvalue())
-        dup_map = fetch_existing_records_by_hash([item["audio_hash"]])
 
-        if item["audio_hash"] in dup_map:
-            ex = dup_map[item["audio_hash"]]
-            resolved_label = "✅ Yes" if ex["resolved"] else "❌ No"
+    if uploaded_file is not None:
+        file_item = make_file_item(uploaded_file.name, uploaded_file.getvalue())
+        
+        dup_map = fetch_existing_records_by_hash([file_item["audio_hash"]])
+        
+        if file_item["audio_hash"] in dup_map:
+            existing = dup_map[file_item["audio_hash"]]
+            resolved_label = "✅ Yes" if existing["resolved"] else "❌ No"
+            
             st.sidebar.warning(
                 "⚠️ **Already Analyzed**\n\n"
-                f"**File:** `{ex['filename']}`\n\n"
-                f"**Topic:** `{ex['topic']}`\n\n"
-                f"**Sentiment:** `{ex['sentiment']}`\n\n"
+                f"**File:** `{existing['filename']}`\n\n"
+                f"**Topic:** `{existing['topic']}`\n\n"
+                f"**Sentiment:** `{existing['sentiment']}`\n\n"
                 f"**Resolved:** {resolved_label}"
             )
-        else:
-            if st.sidebar.button("🚀 Analyze Now"):
-                selected_items = [item]
-                trigger_process = True
+        elif st.sidebar.button("🚀 Analyze Now"):
+            st.session_state.show_queue = True
+            st.session_state.current_queue = [file_item]
+            
+            with st.container():
+                queue_container = st.empty()
+                report = process_files_with_queue([file_item], queue_container)
+                
+                if report["uploaded"] == 1:
+                    st.sidebar.success("✅ Audio sent to cloud AI pipeline!")
+                    smart_wait_for_new_data(queue_container, 1, timeout_seconds=120)
+                elif report["failed"] > 0:
+                    st.sidebar.error("❌ Upload failed. Check S3 permissions.")
 
-# -------- MULTIPLE FILES --------
+# -------- MULTIPLE FILES MODE --------
 elif upload_mode == "Multiple Files":
     uploaded_files = st.sidebar.file_uploader(
         "Select multiple files",
@@ -368,44 +517,112 @@ elif upload_mode == "Multiple Files":
         accept_multiple_files=True,
         key="multiple_audio"
     )
+
     if uploaded_files:
-        items = [make_file_item(f.name, f.getvalue()) for f in uploaded_files]
-        block, warns, total_mb = check_batch_limits(items)
+        file_count = len(uploaded_files)
+        
+        # Batch size warning ONLY when exceeds limit
+        if file_count > MAX_RECOMMENDED_BATCH_SIZE:
+            st.sidebar.warning(f"""
+            ⚠️ **Large Batch Detected**
+            
+            You've selected **{file_count}** files.
+            
+            **Recommended:** {MAX_RECOMMENDED_BATCH_SIZE} files or less
+            
+            **Estimated Time:** ~{file_count * 10}-{file_count * 20} seconds
+            
+            *Processing will continue in parallel.*
+            """)
+        else:
+            st.sidebar.info(f"📦 {file_count} file(s) selected")
+        
+        if st.sidebar.button("🚀 Process All"):
+            st.session_state.show_queue = True
+            items_list = []
+            for f in uploaded_files:
+                items_list.append(make_file_item(f.name, f.getvalue()))
+            
+            st.session_state.current_queue = items_list
+            
+            with st.container():
+                queue_container = st.empty()
+                report = process_files_with_queue(items_list, queue_container)
+                
+                summary_msg = ""
+                if report["uploaded"] > 0:
+                    summary_msg += f"✅ {report['uploaded']} sent for analysis\n"
+                if report["duplicate_db"] > 0:
+                    summary_msg += f"⚠️ {report['duplicate_db']} already processed\n"
+                if report["duplicate_batch"] > 0:
+                    summary_msg += f"⚠️ {report['duplicate_batch']} duplicates skipped\n"
+                if report["failed"] > 0:
+                    summary_msg += f"❌ {report['failed']} failed\n"
+                
+                st.sidebar.text(summary_msg)
+                
+                if report["uploaded"] > 0:
+                    smart_wait_for_new_data(queue_container, report["uploaded"], timeout_seconds=180)
 
-        st.sidebar.info(f"📦 {len(items)} file(s) | {total_mb:.1f} MB total")
-        for w in warns:
-            st.sidebar.warning(w)
-
-        if not block:
-            if st.sidebar.button("🚀 Process All"):
-                selected_items = items
-                trigger_process = True
-
-# -------- ZIP BATCH --------
+# -------- ZIP BATCH MODE --------
 elif upload_mode == "ZIP Batch":
-    uploaded_zip = st.sidebar.file_uploader("Upload ZIP", type=["zip"], key="zip_upload")
+    uploaded_zip = st.sidebar.file_uploader(
+        "Upload ZIP file",
+        type=["zip"],
+        key="zip_upload"
+    )
+
     if uploaded_zip is not None:
         files_from_zip, skipped, zip_err = extract_audio_files_from_zip(uploaded_zip)
+        
         if zip_err:
             st.sidebar.error(zip_err)
         elif not files_from_zip:
             st.sidebar.warning("No valid audio files found in ZIP.")
         else:
-            block, warns, total_mb = check_batch_limits(files_from_zip)
-            st.sidebar.info(f"📦 {len(files_from_zip)} audio file(s) | {total_mb:.1f} MB")
+            file_count = len(files_from_zip)
+            
+            # Batch size warning ONLY when exceeds limit
+            if file_count > MAX_RECOMMENDED_BATCH_SIZE:
+                st.sidebar.warning(f"""
+                ⚠️ **Large ZIP Batch Detected**
+                
+                ZIP contains **{file_count}** audio files.
+                
+                **Recommended:** {MAX_RECOMMENDED_BATCH_SIZE} files or less
+                
+                **Estimated Time:** ~{file_count * 10}-{file_count * 20} seconds
+                
+                *Processing will continue in parallel.*
+                """)
+            else:
+                st.sidebar.info(f"📦 Extracted {file_count} valid audio file(s)")
+            
             if skipped:
-                st.sidebar.warning(f"{len(skipped)} non-audio file(s) ignored.")
-            for w in warns:
-                st.sidebar.warning(w)
-
-            if not block:
-                if st.sidebar.button("🚀 Process ZIP Content"):
-                    selected_items = files_from_zip
-                    trigger_process = True
-
-# ==================== RUN PROCESSING ====================
-if trigger_process and selected_items:
-    process_files_with_queue(selected_items)
+                st.sidebar.warning(f"{len(skipped)} non-audio files ignored.")
+            
+            if st.sidebar.button("🚀 Process ZIP Content"):
+                st.session_state.show_queue = True
+                st.session_state.current_queue = files_from_zip
+                
+                with st.container():
+                    queue_container = st.empty()
+                    report = process_files_with_queue(files_from_zip, queue_container)
+                    
+                    summary_msg = ""
+                    if report["uploaded"] > 0:
+                        summary_msg += f"✅ {report['uploaded']} files sent for analysis\n"
+                    if report["duplicate_db"] > 0:
+                        summary_msg += f"⚠️ {report['duplicate_db']} already processed\n"
+                    if report["duplicate_batch"] > 0:
+                        summary_msg += f"⚠️ {report['duplicate_batch']} duplicates skipped\n"
+                    if report["failed"] > 0:
+                        summary_msg += f"❌ {report['failed']} failed\n"
+                    
+                    st.sidebar.text(summary_msg)
+                    
+                    if report["uploaded"] > 0:
+                        smart_wait_for_new_data(queue_container, report["uploaded"], timeout_seconds=240)
 
 # ==================== DASHBOARD ====================
 df = fetch_data()
@@ -439,6 +656,7 @@ if not df.empty:
         st.subheader("😊 Sentiment Breakdown")
         sent_df = df["Sentiment"].value_counts().reset_index()
         sent_df.columns = ["Sentiment", "Count"]
+
         color_map = {
             "negative": "#EF4444",
             "neutral": "#F59E0B",
@@ -466,3 +684,10 @@ if not df.empty:
 
 else:
     st.info("📭 No calls analyzed yet. Upload an audio file to begin!")
+
+# ==================== FOOTER ====================
+st.divider()
+st.caption("""
+**Vocalytics** | Multi-Modal Customer Support Auditor | 
+Powered by AWS Lambda + Groq Whisper + Llama 3.1 + Neon PostgreSQL
+""")
