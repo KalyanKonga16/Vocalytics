@@ -9,18 +9,14 @@ import zipfile
 import io
 import os
 import re
-from datetime import datetime
 
 st.set_page_config(page_title="Vocalytics", layout="wide")
 st.title("🎧 Multi-Modal Customer Support Auditor")
 
 # ==================== CONFIGURATION ====================
-# How long to wait between checks when processing
-POLL_INTERVAL_SECONDS = 5
-
-# How many total calls before current session started
-# Used to detect when NEW data appears
-initial_count = None
+POLL_INTERVAL_SECONDS = 4
+MAX_TOTAL_BATCH_MB = 50          # Warn only if combined upload exceeds this
+SAFE_FILE_COUNT = 15             # Soft warning if too many files at once
 
 # ==================== DB ====================
 def get_connection():
@@ -84,7 +80,6 @@ def fetch_data() -> pd.DataFrame:
         return pd.DataFrame()
 
 def get_total_row_count():
-    """Get only count for efficient lightweight checks"""
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -118,17 +113,16 @@ def make_file_item(filename, file_bytes):
         "original_name": filename,
         "safe_name": safe_name,
         "bytes": file_bytes,
-        "audio_hash": audio_hash
+        "audio_hash": audio_hash,
+        "size_mb": len(file_bytes) / (1024 * 1024)
     }
 
 def upload_audio_to_s3(s3_client, item):
     bucket = st.secrets["S3_BUCKET"]
     s3_key = f"uploads/{item['audio_hash']}_{item['safe_name']}"
-    
     content_type = "audio/mpeg"
     if item["safe_name"].lower().endswith(".wav"):
         content_type = "audio/wav"
-
     s3_client.put_object(
         Bucket=bucket,
         Key=s3_key,
@@ -140,7 +134,6 @@ def upload_audio_to_s3(s3_client, item):
 def extract_audio_files_from_zip(uploaded_zip):
     extracted_files = []
     skipped_non_audio = []
-
     try:
         with zipfile.ZipFile(io.BytesIO(uploaded_zip.getvalue())) as z:
             for member in z.infolist():
@@ -158,154 +151,177 @@ def extract_audio_files_from_zip(uploaded_zip):
     except zipfile.BadZipFile:
         return [], [], "Invalid ZIP file."
 
-def process_files(file_items):
-    """Smart batch processor:
-    - Skips duplicates inside this batch
-    - Skips duplicates already in DB  
-    - Continues even if one file fails/duplicate
-    - Returns detailed report"""
+# ==================== BATCH SIZE CHECK ====================
+def check_batch_limits(file_items):
+    """Returns (is_too_big, warning_message). Warns only when limits crossed."""
+    total_mb = sum(item["size_mb"] for item in file_items)
+    count = len(file_items)
+
+    warnings = []
+    block = False
+
+    if total_mb > MAX_TOTAL_BATCH_MB:
+        warnings.append(
+            f"🚫 Total upload size is **{total_mb:.1f} MB**, "
+            f"which exceeds the **{MAX_TOTAL_BATCH_MB} MB** batch limit. "
+            f"Please upload fewer/smaller files."
+        )
+        block = True
+
+    if count > SAFE_FILE_COUNT and not block:
+        warnings.append(
+            f"⚠️ You are uploading **{count} files** at once. "
+            f"Processing may take a few minutes. You can still proceed."
+        )
+
+    return block, warnings, total_mb
+
+# ==================== QUEUE-STYLE RENDERER ====================
+STATUS_STYLE = {
+    "queued":    ("⏳", "Queued",      "#6B7280"),
+    "uploading": ("📤", "Uploading",   "#3B82F6"),
+    "analyzing": ("🤖", "Analyzing",   "#8B5CF6"),
+    "done":      ("✅", "Done",        "#10B981"),
+    "skipped":   ("⏭️", "Skipped",     "#F59E0B"),
+    "failed":    ("❌", "Failed",      "#EF4444"),
+}
+
+def render_queue(queue_items, container):
+    """Renders the live queue UI inside a given container."""
+    html = "<div style='display:flex;flex-direction:column;gap:8px;'>"
+    for q in queue_items:
+        icon, label, color = STATUS_STYLE[q["status"]]
+        reason = f"<span style='color:#9CA3AF;font-size:12px;'> — {q['reason']}</span>" if q.get("reason") else ""
+        html += f"""
+        <div style='
+            display:flex;align-items:center;justify-content:space-between;
+            padding:10px 14px;border-radius:10px;
+            background:rgba(255,255,255,0.03);
+            border-left:4px solid {color};'>
+            <div style='font-size:14px;color:#E5E7EB;overflow:hidden;
+                        text-overflow:ellipsis;white-space:nowrap;max-width:60%;'>
+                🎵 {q['name']}
+            </div>
+            <div style='font-size:13px;font-weight:600;color:{color};'>
+                {icon} {label}{reason}
+            </div>
+        </div>
+        """
+    html += "</div>"
+    container.markdown(html, unsafe_allow_html=True)
+
+# ==================== SMART PROCESSOR WITH QUEUE ====================
+def process_files_with_queue(file_items):
+    """
+    Processes files showing a live queue.
+    - Skips duplicates (DB + in-batch)
+    - Uploads new files
+    - Then waits and marks them 'done' as DB rows appear
+    """
     if not file_items:
-        return {"uploaded": 0, "duplicate_db": 0, "duplicate_batch": 0, "failed": 0, "details": []}
+        return
 
-    results = {
-        "uploaded": 0,
-        "duplicate_db": 0,
-        "duplicate_batch": 0,
-        "failed": 0,
-        "details": []
-    }
+    st.subheader("📥 Upload Queue")
+    queue_container = st.empty()
 
+    # Build initial queue
+    queue_items = [
+        {"name": item["original_name"], "status": "queued", "reason": "", "hash": item["audio_hash"]}
+        for item in file_items
+    ]
+    render_queue(queue_items, queue_container)
+    time.sleep(0.4)
+
+    # Pre-fetch existing DB hashes
     all_hashes = [item["audio_hash"] for item in file_items]
     existing_map = fetch_existing_records_by_hash(all_hashes)
 
-    seen_in_this_batch = set()
+    seen_in_batch = set()
     s3 = build_s3_client()
-    total_files = len(file_items)
 
-    progress_bar = st.sidebar.progress(0)
-    status_text = st.sidebar.empty()
+    uploaded_hashes = []   # hashes we actually sent to S3 (need to await analysis)
 
-    for idx, item in enumerate(file_items, start=1):
-        status_text.info(f"Uploading {idx}/{total_files}: {item['original_name']}...")
-        audio_hash = item["audio_hash"]
+    # ---- PHASE 1: Upload / Skip ----
+    for i, item in enumerate(file_items):
+        h = item["audio_hash"]
 
-        # Duplicate inside same upload?
-        if audio_hash in seen_in_this_batch:
-            results["duplicate_batch"] += 1
-            results["details"].append({
-                "File": item["original_name"], 
-                "Status": "Skipped", 
-                "Reason": "Duplicate in this batch"
-            })
-            progress_bar.progress(idx / total_files)
+        # Duplicate inside same batch
+        if h in seen_in_batch:
+            queue_items[i]["status"] = "skipped"
+            queue_items[i]["reason"] = "Duplicate in this upload"
+            render_queue(queue_items, queue_container)
             continue
-        
-        seen_in_this_batch.add(audio_hash)
+        seen_in_batch.add(h)
 
-        # Already processed in DB?
-        if audio_hash in existing_map:
-            existing = existing_map[audio_hash]
-            results["duplicate_db"] += 1
-            results["details"].append({
-                "File": item["original_name"], 
-                "Status": "Skipped", 
-                "Reason": f"Already analyzed ({existing['topic']}, {existing['sentiment']})"
-            })
-            progress_bar.progress(idx / total_files)
+        # Already in DB
+        if h in existing_map:
+            ex = existing_map[h]
+            queue_items[i]["status"] = "skipped"
+            queue_items[i]["reason"] = f"Already analyzed ({ex['topic']})"
+            render_queue(queue_items, queue_container)
             continue
 
-        # New file: upload!
+        # Upload
+        queue_items[i]["status"] = "uploading"
+        render_queue(queue_items, queue_container)
         try:
-            s3_key = upload_audio_to_s3(s3, item)
-            results["uploaded"] += 1
-            results["details"].append({
-                "File": item["original_name"], 
-                "Status": "Processing...", 
-                "Reason": f"Sent to S3"
-            })
+            upload_audio_to_s3(s3, item)
+            queue_items[i]["status"] = "analyzing"
+            queue_items[i]["reason"] = "Sent to AI pipeline"
+            uploaded_hashes.append(h)
+            render_queue(queue_items, queue_container)
         except Exception as e:
-            results["failed"] += 1
-            results["details"].append({
-                "File": item["original_name"], 
-                "Status": "Failed", 
-                "Reason": str(e)
-            })
+            queue_items[i]["status"] = "failed"
+            queue_items[i]["reason"] = str(e)[:40]
+            render_queue(queue_items, queue_container)
 
-        progress_bar.progress(idx / total_files)
+        time.sleep(0.3)
 
-    progress_bar.empty()
-    status_text.empty()
-    return results
+    # ---- PHASE 2: Await analysis completion ----
+    if uploaded_hashes:
+        status_banner = st.empty()
+        pending = set(uploaded_hashes)
+        start = time.time()
+        timeout = 60 + (len(uploaded_hashes) * 20)  # scale with batch size
 
-def smart_wait_for_new_data(timeout_seconds=120):
-    """
-    After upload, check DB periodically until new rows appear.
-    Returns True once fresh data detected, or False on timeout.
-    This replaces the ugly auto-refresh approach.
-    """
-    global initial_count
-    
-    start_time = time.time()
-    max_wait = timeout_seconds
-    
-    placeholder = st.empty()
-    
-    # Step 1: Record how many rows exist BEFORE we started waiting
-    pre_upload_count = get_total_row_count()
-    
-    # If DB was empty initially, we will watch for first non-empty result
-    watching_for_first_data = False
-    if pre_upload_count == 0:
-        watching_for_first_data = True
-        # Wait a few extra seconds for S3 trigger + Lambda cold start + Whisper + Llama + DB insert
-        initial_sleep = 8
-        time.sleep(initial_sleep)
-    
-    polls = 0
-    
-    while True:
-        elapsed = time.time() - start_time
-        
-        if elapsed > max_wait:
-            # Timeout reached
-            placeholder.success("✅ Analysis pipeline triggered! (Checking for completion...)")
-            time.sleep(5)  # Allow one final check then we just end the wait gracefully
-            return True
-            
-        # Light sleep to avoid heavy CPU usage
-        time.sleep(POLL_INTERVAL_SECONDS)
-        polls += 1
-        
-        # Get fresh count efficiently
-        current_count = get_total_row_count()
-        
-        # Build the spinner status message
-        if watching_for_first_data:
-            if current_count > 0:
-                placeholder.success(f"🎉 New data arrived! Found {current_count} call(s). Loading dashboard...")
-                time.sleep(2)
-                return True
-            else:
-                remaining = int(max_wait - elapsed)
-                placeholder.info(
-                    f"⏳ Awaiting AI Analysis... "
-                    f"(Waiting for serverless pipeline: Lambda + Groq Whisper + Llama)\n"
-                    f"⏱️ Elapsed: {int(elapsed)}s | ⏰ Timeout in: {remaining}s | 🔍 Check #{polls})"
-                )
+        # small head start for Lambda cold start
+        time.sleep(6)
+
+        while pending and (time.time() - start) < timeout:
+            done_map = fetch_existing_records_by_hash(list(pending))
+
+            for i, q in enumerate(queue_items):
+                if q["hash"] in done_map and q["status"] == "analyzing":
+                    info = done_map[q["hash"]]
+                    queue_items[i]["status"] = "done"
+                    queue_items[i]["reason"] = f"{info['topic']} | {info['sentiment']}"
+
+            render_queue(queue_items, queue_container)
+
+            pending = {h for h in pending if h not in done_map}
+
+            if not pending:
+                break
+
+            elapsed = int(time.time() - start)
+            remaining = int(timeout - elapsed)
+            status_banner.info(
+                f"🤖 AI agents working... {len(uploaded_hashes) - len(pending)}/{len(uploaded_hashes)} completed "
+                f"| ⏱️ {elapsed}s elapsed | ⏰ {remaining}s left"
+            )
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+        if pending:
+            # Some still not done (slow Lambda) — mark gracefully
+            for i, q in enumerate(queue_items):
+                if q["hash"] in pending and q["status"] == "analyzing":
+                    queue_items[i]["reason"] = "Still processing (will appear shortly)"
+            render_queue(queue_items, queue_container)
+            status_banner.warning("⏳ Some files are still processing. Dashboard will show them shortly.")
         else:
-            # Watching for specific number of rows to increase
-            if current_count > pre_upload_count:
-                new_rows = current_count - pre_upload_count
-                placeholder.success(f"🎉 Success! {new_rows} new call(s) analyzed and saved.")
-                time.sleep(2)
-                return True
-            else:
-                remaining = int(max_wait - elapsed)
-                placeholder.info(
-                    f"⏳ Processing audio via Cloud AI agents...\n"
-                    f"⏱️ Elapsed: {int(elapsed)}s | ⏰ Timeout in: {remaining}s | 🔍 Poll #{polls} | "
-                    f"(Current DB: {current_count} | Expected: >{pre_upload_count})"
-                )
+            status_banner.success("🎉 All uploaded calls analyzed successfully!")
+
+        time.sleep(2)
 
 # ==================== SIDEBAR ====================
 st.sidebar.header("📤 Upload Mode")
@@ -315,43 +331,36 @@ upload_mode = st.sidebar.radio(
     ["Single File", "Multiple Files", "ZIP Batch"]
 )
 
+selected_items = []
+trigger_process = False
+
+# -------- SINGLE FILE --------
 if upload_mode == "Single File":
     uploaded_file = st.sidebar.file_uploader(
         "Select an audio file",
         type=["mp3", "wav"],
         key="single_audio"
     )
-
     if uploaded_file is not None:
-        file_item = make_file_item(uploaded_file.name, uploaded_file.getvalue())
-        
-        # Quick local check before showing anything
-        dup_map = fetch_existing_records_by_hash([file_item["audio_hash"]])
-        
-        if file_item["audio_hash"] in dup_map:
-            existing = dup_map[file_item["audio_hash"]]
-            resolved_label = "✅ Yes" if existing["resolved"] else "❌ No"
-            
+        item = make_file_item(uploaded_file.name, uploaded_file.getvalue())
+        dup_map = fetch_existing_records_by_hash([item["audio_hash"]])
+
+        if item["audio_hash"] in dup_map:
+            ex = dup_map[item["audio_hash"]]
+            resolved_label = "✅ Yes" if ex["resolved"] else "❌ No"
             st.sidebar.warning(
                 "⚠️ **Already Analyzed**\n\n"
-                f"**File:** `{existing['filename']}`\n\n"
-                f"**Topic:** `{existing['topic']}`\n\n"
-                f"**Sentiment:** `{existing['sentiment']}`\n\n"
-                f"**Resolved:** {resolved_label}\n\n"
-                f"*This exact audio content already exists in database."
+                f"**File:** `{ex['filename']}`\n\n"
+                f"**Topic:** `{ex['topic']}`\n\n"
+                f"**Sentiment:** `{ex['sentiment']}`\n\n"
+                f"**Resolved:** {resolved_label}"
             )
-        elif st.sidebar.button("🚀 Analyze Now"):
-            report = process_files([file_item])
-            
-            if report["uploaded"] == 1:
-                st.sidebar.success("✅ Audio sent to cloud!")
-                
-                # Trigger smooth freeze/wait state
-                smart_wait_for_new_data(timeout_seconds=120)
-                
-            elif report["failed"] > 0:
-                st.sidebar.error("❌ Upload failed. Check S3 permissions.")
+        else:
+            if st.sidebar.button("🚀 Analyze Now"):
+                selected_items = [item]
+                trigger_process = True
 
+# -------- MULTIPLE FILES --------
 elif upload_mode == "Multiple Files":
     uploaded_files = st.sidebar.file_uploader(
         "Select multiple files",
@@ -359,83 +368,44 @@ elif upload_mode == "Multiple Files":
         accept_multiple_files=True,
         key="multiple_audio"
     )
-
     if uploaded_files:
-        st.sidebar.info(f"📦 {len(uploaded_files)} file(s) selected")
-        
-        if st.sidebar.button("🚀 Process All"):
-            items_list = []
-            for f in uploaded_files:
-                items_list.append(make_file_item(f.name, f.getvalue()))
-            
-            report = process_files(items_list)
-            
-            summary_msg = ""
-            if report["uploaded"] > 0:
-                summary_msg += f"✅ {report['uploaded']} sent for analysis\n\n"
-            if report["duplicate_db"] > 0:
-                summary_msg += f"⚠️ {report['duplicate_db']} already processed (skipped)\n\n"
-            if report["duplicate_batch"] > 0:
-                summary_msg += f"⚠️ {report['duplicate_batch']} duplicates skipped\n\n"
-            if report["failed"] > 0:
-                summary_msg += f"❌ {report['failed']} failed\n\n"
-            
-            st.sidebar.text(summary_msg)
-            
-            if report["uploaded"] > 0:
-                smart_wait_for_new_data(timeout_seconds=180)  # Longer timeout for multiple files
+        items = [make_file_item(f.name, f.getvalue()) for f in uploaded_files]
+        block, warns, total_mb = check_batch_limits(items)
 
+        st.sidebar.info(f"📦 {len(items)} file(s) | {total_mb:.1f} MB total")
+        for w in warns:
+            st.sidebar.warning(w)
+
+        if not block:
+            if st.sidebar.button("🚀 Process All"):
+                selected_items = items
+                trigger_process = True
+
+# -------- ZIP BATCH --------
 elif upload_mode == "ZIP Batch":
-    uploaded_zip = st.sidebar.file_uploader(
-        "Upload ZIP",
-        type=["zip"],
-        key="zip_upload"
-    )
-
+    uploaded_zip = st.sidebar.file_uploader("Upload ZIP", type=["zip"], key="zip_upload")
     if uploaded_zip is not None:
         files_from_zip, skipped, zip_err = extract_audio_files_from_zip(uploaded_zip)
-        
         if zip_err:
             st.sidebar.error(zip_err)
         elif not files_from_zip:
             st.sidebar.warning("No valid audio files found in ZIP.")
         else:
-            st.sidebar.info(f"📦 Extracted {len(files_from_zip)} valid audio file(s)")
-            
+            block, warns, total_mb = check_batch_limits(files_from_zip)
+            st.sidebar.info(f"📦 {len(files_from_zip)} audio file(s) | {total_mb:.1f} MB")
             if skipped:
-                st.sidebar.warning(f"{len(skipped)} non-audio files ignored.")
-            
-            if st.sidebar.button("🚀 Process ZIP Content"):
-                report = process_files(files_from_zip)
-                
-                summary_msg = ""
-                if report["uploaded"] > 0:
-                    summary_msg += f"✅ {report['uploaded']} files sent for analysis\n\n"
-                if report["duplicate_db"] > 0:
-                    summary_msg += f"⚠️ {report['duplicate_db']} already processed (skipped)\n\n"
-                if report["duplicate_batch"] > 0:
-                    summary_msg += f"⚠️ {report['duplicate_batch']} duplicates skipped\n\n"
-                if report["failed"] > 0:
-                    summary_msg += f"❌ {report['failed']} failed\n\n"
-                
-                st.sidebar.text(summary_msg)
-                
-                if report["uploaded"] > 0:
-                    smart_wait_for_new_data(timeout_seconds=240)  # Even longer for big ZIP batches
+                st.sidebar.warning(f"{len(skipped)} non-audio file(s) ignored.")
+            for w in warns:
+                st.sidebar.warning(w)
 
-# ==================== REPORT DRAWER ====================
-if "last_upload_report" in st.session_state:
-    rpt = st.session_state["last_upload_report"]
-    
-    with st.expander(f"📊 Last Upload Report (Uploaded: {rpt['uploaded']})"):
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("📤 Sent to AI", rpt["uploaded"])
-        c2.metric("⏭️ Already Done", rpt["duplicate_db"])
-        c3.metric("⚠️ Duplicates in Batch", rpt["duplicate_batch"])
-        c4.metric("❌ Failed", rpt["failed"])
-        
-        if rpt["details"]:
-            st.dataframe(pd.DataFrame(rpt["details"]), hide_index=True, use_container_width=True)
+            if not block:
+                if st.sidebar.button("🚀 Process ZIP Content"):
+                    selected_items = files_from_zip
+                    trigger_process = True
+
+# ==================== RUN PROCESSING ====================
+if trigger_process and selected_items:
+    process_files_with_queue(selected_items)
 
 # ==================== DASHBOARD ====================
 df = fetch_data()
@@ -469,7 +439,6 @@ if not df.empty:
         st.subheader("😊 Sentiment Breakdown")
         sent_df = df["Sentiment"].value_counts().reset_index()
         sent_df.columns = ["Sentiment", "Count"]
-
         color_map = {
             "negative": "#EF4444",
             "neutral": "#F59E0B",
